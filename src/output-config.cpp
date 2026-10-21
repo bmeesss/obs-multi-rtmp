@@ -28,6 +28,8 @@ static nlohmann::json SaveTarget(OutputTargetConfig& config) {
     json["sync-start"] = config.syncStart;
     json["sync-stop"] = config.syncStop;
     json["enabled"] = config.enabled;
+    json["reconnect-max-retries"] = config.reconnectMaxRetries;
+    json["reconnect-retry-delay"] = config.reconnectRetryDelaySec;
     if (config.videoConfig.has_value())
         json["video-config"] = *config.videoConfig;
     if (config.audioConfig.has_value())
@@ -129,6 +131,13 @@ static OutputTargetConfigPtr LoadTargetConfig(nlohmann::json& json) {
     config->syncStart = GetJsonField<bool>(json, "sync-start").value_or(false);
     config->syncStop = GetJsonField<bool>(json, "sync-stop").value_or(config->syncStart);
     config->enabled = GetJsonField<bool>(json, "enabled").value_or(true);
+    // Missing fields mean the config predates the reconnect settings; use the
+    // libobs defaults. Clamp hand-edited values so libobs never gets a 0 s
+    // delay (which would retry in a tight loop) or an absurd retry count.
+    config->reconnectMaxRetries =
+        std::clamp(GetJsonField<int>(json, "reconnect-max-retries").value_or(20), 0, 100);
+    config->reconnectRetryDelaySec =
+        std::clamp(GetJsonField<int>(json, "reconnect-retry-delay").value_or(2), 1, 60);
     config->serviceParam = GetJsonField<nlohmann::json>(json, "service-param").value_or(nlohmann::json{});
     config->outputParam = GetJsonField<nlohmann::json>(json, "output-param").value_or(nlohmann::json{});
     config->videoConfig = GetJsonField<std::string>(json, "video-config");

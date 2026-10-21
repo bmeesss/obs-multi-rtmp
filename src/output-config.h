@@ -47,6 +47,14 @@ struct OutputTargetConfig {
     // that's down) without deleting and re-creating it.
     bool enabled = true;
 
+    // Reconnect policy for this target's output. The defaults are the libobs
+    // defaults (20 retries, 2 s base delay), so configurations saved before
+    // these fields existed keep behaving exactly as before. A value of 0
+    // attempts disables automatic reconnecting (libobs checks
+    // reconnect_retry_max != 0 before reconnecting).
+    int reconnectMaxRetries = 20;
+    int reconnectRetryDelaySec = 2;
+
     nlohmann::json serviceParam;
     nlohmann::json outputParam;
 

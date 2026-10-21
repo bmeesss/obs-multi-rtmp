@@ -6,6 +6,7 @@
 #include <QTabWidget>
 #include <qevent.h>
 #include <QComboBox>
+#include <QSpinBox>
 
 #include <regex>
 
@@ -250,6 +251,9 @@ class EditTargetPanelImpl: public EditTargetPanel
 
     QCheckBox* syncStart_ = 0;
     QCheckBox* syncStop_ = 0;
+
+    QSpinBox* reconnectMaxRetries_ = 0;
+    QSpinBox* reconnectRetryDelay_ = 0;
 
     std::vector<std::string> EnumEncodersByCodec(const char* codec)
     {
@@ -579,6 +583,26 @@ public:
                     auto otherLayout = new QGridLayout();
                     otherLayout->addWidget(syncStart_ = new QCheckBox(obs_module_text("SyncStart"), gp), 0, 0);
                     otherLayout->addWidget(syncStop_ = new QCheckBox(obs_module_text("SyncStop"), gp), 1, 0);
+
+                    otherLayout->addWidget(new QLabel(obs_module_text("Reconnect.MaxRetries"), gp), 2, 0);
+                    otherLayout->addWidget(reconnectMaxRetries_ = new QSpinBox(gp), 2, 1);
+                    reconnectMaxRetries_->setRange(0, 100);
+                    // Shown instead of "0" so the meaning of 0 is explicit.
+                    reconnectMaxRetries_->setSpecialValueText(obs_module_text("Reconnect.Disabled"));
+                    reconnectMaxRetries_->setToolTip(obs_module_text("Reconnect.MaxRetriesTip"));
+
+                    otherLayout->addWidget(new QLabel(obs_module_text("Reconnect.RetryDelay"), gp), 3, 0);
+                    otherLayout->addWidget(reconnectRetryDelay_ = new QSpinBox(gp), 3, 1);
+                    reconnectRetryDelay_->setRange(1, 60);
+                    reconnectRetryDelay_->setToolTip(obs_module_text("Reconnect.RetryDelayTip"));
+
+                    // The delay is unused while automatic reconnecting is off.
+                    QObject::connect(
+                        reconnectMaxRetries_, QOverload<int>::of(&QSpinBox::valueChanged), [this](int retries) {
+                            reconnectRetryDelay_->setEnabled(retries > 0);
+                        }
+                    );
+
                     gp->setLayout(otherLayout);
                 }
             }
@@ -774,6 +798,8 @@ public:
 
         auto sharedAudioTargets = GetEncoderShareTargets(true);
         a_share_notify_->setText(QString::fromUtf8(obs_module_text("EncoderShare") + makeShareNotify(sharedAudioTargets)));
+
+        reconnectRetryDelay_->setEnabled(reconnectMaxRetries_->value() > 0);
     }
 
     std::vector<std::string> GetEncoderShareTargets(bool isAudio) {
@@ -874,6 +900,8 @@ public:
         config_->protocol = tostdu8(protocolSelector_->itemData(protocolSelector_->currentIndex()).toString());
         config_->syncStart = syncStart_->isChecked();
         config_->syncStop = syncStop_->isChecked();
+        config_->reconnectMaxRetries = reconnectMaxRetries_->value();
+        config_->reconnectRetryDelaySec = reconnectRetryDelay_->value();
         config_->outputParam = outputSettings_->Save();
         config_->serviceParam = serviceSettings_->Save();
 
@@ -915,6 +943,10 @@ public:
         protocolSelector_->setCurrentIndex(protocolIndex);
         syncStart_->setChecked(target.syncStart);
         syncStop_->setChecked(target.syncStop);
+        // QSpinBox clamps to its range, so values from a hand-edited config or
+        // a newer config version can never leave the UI in an invalid state.
+        reconnectMaxRetries_->setValue(target.reconnectMaxRetries);
+        reconnectRetryDelay_->setValue(target.reconnectRetryDelaySec);
     }
 
     using IdOrVideoConfig = std::variant<std::string_view, VideoEncoderConfig*>;

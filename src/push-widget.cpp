@@ -35,18 +35,26 @@ public:
         thiz->OnStopping();
     }
    
-    virtual void OnStopped(int) {}
+    virtual void OnStopped(int, const std::string&) {}
     static void OnOutputStopped(void* x, calldata_t* param)
     {
         auto thiz = static_cast<IOBSOutputEventHanlder*>(x);
-        thiz->OnStopped(calldata_int(param, "code"));
+        // libobs fills "last_error" from obs_output_get_last_error() right
+        // before emitting "stop" (libobs/obs-output.c, signal_stop()), so the
+        // value belongs to this signal invocation. Copy it here, on the thread
+        // that emits the signal, while the output is still alive; the copy is
+        // then safe to hand to the UI thread.
+        auto lastError = calldata_string(param, "last_error");
+        thiz->OnStopped((int)calldata_int(param, "code"), lastError ? std::string(lastError) : std::string());
     }
 
-    virtual void OnReconnect() {}
-    static void OnOutputReconnect(void* x, calldata_t*)
+    // timeout_sec is the delay libobs scheduled for the next attempt. It is
+    // informational only; the plugin does not display it as a countdown.
+    virtual void OnReconnect(int) {}
+    static void OnOutputReconnect(void* x, calldata_t* param)
     {
         auto thiz = static_cast<IOBSOutputEventHanlder*>(x);
-        thiz->OnReconnect();
+        thiz->OnReconnect((int)calldata_int(param, "timeout_sec"));
     }
 
     virtual void OnReconnected() {}
@@ -95,6 +103,15 @@ public:
 };
 
 
+// Encoder names are only read while the caller still holds a valid reference
+// (either our own ref or the output's slot), never after a detach/release.
+static const char* EncoderNameOrUnknown(const obs_encoder_t* encoder)
+{
+    const char* name = encoder ? obs_encoder_get_name(encoder) : nullptr;
+    return name ? name : "(unknown)";
+}
+
+
 class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
 {
     std::string targetid_;
@@ -126,6 +143,12 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
     bool isConnecting_ = false;
     bool isReconnecting_ = false;
     int lastErrorCode_ = 0;
+
+    // Number of "reconnect" signals seen for the current attempt sequence, and
+    // the retry limit that was applied to the current output. Both are only
+    // touched on the UI thread.
+    int reconnectAttempts_ = 0;
+    int reconnectMaxRetries_ = 0;
 
     // Registered under the stable target id (not the display name) so key
     // bindings survive renames. Their description label is set once at
@@ -163,6 +186,8 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
         obs_data_release(conf);
         if (!service)
             return false;
+        blog(LOG_INFO, TAG "Target '%s': created service '%s' (id '%s')", targetid_.c_str(),
+             obs_service_get_name(service), service_id);
         obs_output_set_service(output_, service);
 
         return true;
@@ -181,6 +206,7 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
         auto service = obs_output_get_service(output_);
         if (service)
         {
+            blog(LOG_INFO, TAG "Target '%s': releasing service '%s'", targetid_.c_str(), obs_service_get_name(service));
             obs_output_set_service(output_, nullptr);
             obs_service_release(service);
         }
@@ -203,12 +229,14 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
             auto videoConfig = FindById(GlobalMultiOutputConfig().videoConfig, config_->videoConfig.value_or(""));
 
             if (!videoConfig || !videoConfig->outputScene.has_value()) {
+                blog(LOG_DEBUG, TAG "Target '%s': video source is OBS's main video output", targetid_.c_str());
                 obs_encoder_set_video(venc, obs_get_video());
             } else {
                 auto sceneName = *videoConfig->outputScene;
                 OBSSourceAutoRelease scene = obs_get_source_by_name(sceneName.c_str());
                 if (scene == nullptr) {
-                    blog(LOG_ERROR, TAG "Output scene is not found.");
+                    blog(LOG_ERROR, TAG "Target '%s': output scene '%s' is not found.", targetid_.c_str(),
+                         sceneName.c_str());
                     return false;
                 }
                 ReleaseOutputSceneView();
@@ -218,6 +246,8 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
                 obs_source_inc_active(scene);
                 auto scene_video = obs_view_add(scene_view_);
                 obs_encoder_set_video(venc, scene_video);
+                blog(LOG_INFO, TAG "Target '%s': created dedicated view for scene '%s'", targetid_.c_str(),
+                     sceneName.c_str());
             }
         }
 
@@ -249,6 +279,7 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
         if (!scene_view_)
             return true;
 
+        blog(LOG_INFO, TAG "Target '%s': releasing dedicated scene view", targetid_.c_str());
         obs_view_remove(scene_view_);
         OBSSourceAutoRelease source = obs_view_get_source(scene_view_, 0);
         if (source) {
@@ -291,14 +322,25 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
             OBSOutputAutoRelease stream_output = obs_frontend_get_streaming_output();
             OBSEncoder enc = obs_output_get_video_encoder(stream_output);
             using_main_video_encoder_ = true;
+            blog(LOG_INFO, TAG "Target '%s': using OBS's streaming video encoder '%s' (shared, OBS-managed)",
+                 targetid_.c_str(), EncoderNameOrUnknown(enc.Get()));
             return enc.Get();
         } else if (config_id == OBS_RECORDING_ENC_PLACEHOLDER) {
             OBSOutputAutoRelease stream_output = obs_frontend_get_recording_output();
             OBSEncoder enc = obs_output_get_video_encoder(stream_output);
             using_main_video_encoder_ = true;
+            blog(LOG_INFO, TAG "Target '%s': using OBS's recording video encoder '%s' (shared, OBS-managed)",
+                 targetid_.c_str(), EncoderNameOrUnknown(enc.Get()));
             return enc.Get();
         } else {
             OBSEncoderAutoRelease enc = obs_get_encoder_by_name(VideoEncoderName().c_str());
+            if (enc) {
+                // A second target with the same video config reuses this
+                // encoder object; say so explicitly instead of pretending this
+                // target owns it.
+                blog(LOG_INFO, TAG "Target '%s': reusing existing video encoder '%s' (plugin-managed, possibly shared)",
+                     targetid_.c_str(), EncoderNameOrUnknown(enc.Get()));
+            }
             if (!enc) {
                 auto& global = GlobalMultiOutputConfig();
                 auto videoConfig = FindById(global.videoConfig, config_id);
@@ -313,10 +355,14 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
                             obs_encoder_set_scaled_size(enc, w, h);
                         }
                         obs_encoder_set_frame_rate_divisor(enc, videoConfig->fpsDenumerator);
+                        blog(LOG_INFO, TAG "Target '%s': created video encoder '%s' (id '%s', plugin-managed)",
+                             targetid_.c_str(), EncoderNameOrUnknown(enc.Get()), videoConfig->encoderId.c_str());
                     }
                 } else {
                     assert(false && "No video encoder config found with specified id.");
-                    blog(LOG_ERROR, TAG "Load video encoder config failed for %s. Sharing with main output.", config_->name.c_str());
+                    blog(LOG_ERROR,
+                         TAG "Target '%s': video encoder config '%s' not found; sharing OBS's streaming encoder.",
+                         targetid_.c_str(), config_id.c_str());
                     config_->videoConfig = OBS_STREAMING_ENC_PLACEHOLDER;
                     return GetVideoEncoder();
                 }
@@ -333,14 +379,26 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
             OBSOutputAutoRelease stream_output = obs_frontend_get_streaming_output();
             OBSEncoder enc = obs_output_get_audio_encoder(stream_output, 0);
             using_main_audio_encoder_ = true;
+            blog(LOG_INFO,
+                 TAG "Target '%s': using OBS's streaming audio encoder '%s' for track %d (shared, OBS-managed)",
+                 targetid_.c_str(), EncoderNameOrUnknown(enc.Get()), trackIdx);
             return enc.Get();
         } else if (config_id == OBS_RECORDING_ENC_PLACEHOLDER) {
             OBSOutputAutoRelease stream_output = obs_frontend_get_recording_output();
             OBSEncoder enc = obs_output_get_audio_encoder(stream_output, 0);
             using_main_audio_encoder_ = true;
+            blog(LOG_INFO,
+                 TAG "Target '%s': using OBS's recording audio encoder '%s' for track %d (shared, OBS-managed)",
+                 targetid_.c_str(), EncoderNameOrUnknown(enc.Get()), trackIdx);
             return enc.Get();
         } else {
             OBSEncoderAutoRelease enc = obs_get_encoder_by_name(AudioEncoderName(trackIdx).c_str());
+            if (enc) {
+                blog(LOG_INFO,
+                     TAG "Target '%s': reusing existing audio encoder '%s' for track %d "
+                         "(plugin-managed, possibly shared)",
+                     targetid_.c_str(), EncoderNameOrUnknown(enc.Get()), trackIdx);
+            }
             if (!enc) {
                 auto& global = GlobalMultiOutputConfig();
                 auto audioConfigId = *config_->audioConfig;
@@ -355,9 +413,18 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
                     }
 
                     enc = obs_audio_encoder_create(audioConfig->encoderId.c_str(), AudioEncoderName(trackIdx).c_str(), settings, defaultMixerId, nullptr);
+                    if (enc) {
+                        blog(LOG_INFO,
+                             TAG "Target '%s': created audio encoder '%s' for track %d "
+                                 "(id '%s', mixer %d, plugin-managed)",
+                             targetid_.c_str(), EncoderNameOrUnknown(enc.Get()), trackIdx,
+                             audioConfig->encoderId.c_str(), defaultMixerId);
+                    }
                 } else {
                     assert(false && "No audio encoder config found with specified id.");
-                    blog(LOG_ERROR, TAG "Load audio encoder config failed for %s. Sharing with main output.", config_->name.c_str());
+                    blog(LOG_ERROR,
+                         TAG "Target '%s': audio encoder config '%s' not found; sharing OBS's streaming encoder.",
+                         targetid_.c_str(), config_id.c_str());
                     config_->audioConfig = OBS_STREAMING_ENC_PLACEHOLDER;
                     return GetAudioEncoder();
                 }
@@ -376,6 +443,11 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
         }
         
         ReleaseOutputEncoder();
+
+        const std::string videoConfigForLog = config_->videoConfig.value_or(OBS_STREAMING_ENC_PLACEHOLDER);
+        const std::string audioConfigForLog = config_->audioConfig.value_or(OBS_STREAMING_ENC_PLACEHOLDER);
+        blog(LOG_INFO, TAG "Target '%s': preparing encoders (video config '%s', audio config '%s')", targetid_.c_str(),
+             videoConfigForLog.c_str(), audioConfigForLog.c_str());
 
         auto& global = GlobalMultiOutputConfig();
 
@@ -443,6 +515,11 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
             auto venc = obs_output_get_video_encoder(output_);
             if (venc)
             {
+                // Log while the output still holds the encoder; this pointer is
+                // borrowed and must not be used after the detach below.
+                blog(LOG_INFO, TAG "Target '%s': detaching video encoder '%s' from output '%s' (%s)",
+                     targetid_.c_str(), EncoderNameOrUnknown(venc), obs_output_get_name(output_),
+                     using_main_video_encoder_ ? "OBS-managed, shared" : "plugin-managed");
                 obs_output_set_video_encoder(output_, nullptr);
                 obs_encoder_release(venc);
             }
@@ -450,6 +527,9 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
             auto aenc = obs_output_get_audio_encoder(output_, 0);
             if (aenc)
             {
+                blog(LOG_INFO, TAG "Target '%s': detaching audio encoder '%s' from output '%s' (track 0, %s)",
+                     targetid_.c_str(), EncoderNameOrUnknown(aenc), obs_output_get_name(output_),
+                     using_main_audio_encoder_ ? "OBS-managed, shared" : "plugin-managed");
                 obs_output_set_audio_encoder(output_, nullptr, 0);
                 obs_encoder_release(aenc);
             }
@@ -457,7 +537,8 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
             return true;
         }
         else {
-            blog(LOG_ERROR, TAG "Release output while it is active.");
+            blog(LOG_ERROR, TAG "Target '%s': refused to release encoders while output '%s' is active.",
+                 targetid_.c_str(), obs_output_get_name(output_));
             return false;
         }
     }
@@ -466,6 +547,7 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
     bool ReleaseOutput()
     {
         if (output_) {
+            blog(LOG_INFO, TAG "Target '%s': releasing output '%s'", targetid_.c_str(), obs_output_get_name(output_));
             DisconnectSignals(output_);
         }
 
@@ -696,9 +778,22 @@ public:
 
             output_ = obs_output_create(output_id, "multi-output", output_settings, nullptr);
             SetMeAsHandler(output_);
+            if (output_) {
+                blog(LOG_INFO, TAG "Target '%s': created output '%s' (id '%s')", targetid_.c_str(),
+                     obs_output_get_name(output_), output_id);
+            }
         }
 
         if (output_) {
+            // Must be applied before the output starts: libobs reads these
+            // values when it decides whether a dropped connection may be
+            // retried. 0 attempts disables automatic reconnecting.
+            reconnectAttempts_ = 0;
+            reconnectMaxRetries_ = config_->reconnectMaxRetries;
+            obs_output_set_reconnect_settings(output_, config_->reconnectMaxRetries, config_->reconnectRetryDelaySec);
+            blog(LOG_INFO, TAG "Target '%s': reconnect policy: %d attempts, %d s base delay", targetid_.c_str(),
+                 config_->reconnectMaxRetries, config_->reconnectRetryDelaySec);
+
             isUseDelay_ = false;
 
             auto profileConfig = obs_frontend_get_profile_config();
@@ -797,6 +892,7 @@ public:
         total_bytes_ = 0;
         last_info_time_ = clock::now();
         msg_->setText("");
+        msg_->setToolTip("");
     }
 
     bool IsRunning() override
@@ -864,6 +960,7 @@ public:
             isConnecting_ = true;
             isReconnecting_ = false;
             lastErrorCode_ = 0;
+            reconnectAttempts_ = 0;
             remove_btn_->setEnabled(false);
             btn_->setText(obs_module_text("Status.Stop"));
             btn_->setEnabled(true);
@@ -879,6 +976,7 @@ public:
             isStarting_ = false;
             isConnecting_ = false;
             isReconnecting_ = false;
+            reconnectAttempts_ = 0;
             remove_btn_->setEnabled(false);
             btn_->setText(obs_module_text("Status.Stop"));
             btn_->setEnabled(true);
@@ -890,16 +988,30 @@ public:
         });
     }
 
-    void OnReconnect() override
+    void OnReconnect(int timeoutSec) override
     {
-        GetGlobalService().RunInUIThread([this]() {
+        // Everything that touches member state happens on the UI thread, so
+        // the counter cannot race with OnStarted/OnStopped. The attempt number
+        // is derived from libobs's own "reconnect" signals (one per scheduled
+        // retry); the delay is only logged, never shown as a countdown.
+        GetGlobalService().RunInUIThread([this, timeoutSec]() {
+            ++reconnectAttempts_;
             timer_->stop();
             isReconnecting_ = true;
+
+            blog(LOG_INFO, TAG "Target '%s': reconnect attempt %d of %d scheduled by OBS (%d s)",
+                 targetid_.c_str(), reconnectAttempts_, reconnectMaxRetries_, timeoutSec);
 
             remove_btn_->setEnabled(false);
             btn_->setText(obs_module_text("Status.Stop"));
             btn_->setEnabled(true);
-            SetMsg(obs_module_text("Status.Reconnecting"));
+            if (reconnectMaxRetries_ > 0) {
+                SetMsg(QString::fromUtf8(obs_module_text("Status.ReconnectingAttempts"))
+                           .arg(reconnectAttempts_)
+                           .arg(reconnectMaxRetries_));
+            } else {
+                SetMsg(obs_module_text("Status.Reconnecting"));
+            }
             UpdateStatusDot();
         });
     }
@@ -908,6 +1020,7 @@ public:
     {
         GetGlobalService().RunInUIThread([this]() {
             isReconnecting_ = false;
+            reconnectAttempts_ = 0;
             remove_btn_->setEnabled(false);
             btn_->setText(obs_module_text("Status.Stop"));
             btn_->setEnabled(true);
@@ -931,13 +1044,21 @@ public:
         });
     }
 
-    void OnStopped(int code) override
+    void OnStopped(int code, const std::string& lastError) override
     {
-        GetGlobalService().RunInUIThread([this, code]() {
+        if (code == OBS_OUTPUT_SUCCESS) {
+            blog(LOG_INFO, TAG "Target '%s': output stopped normally", targetid_.c_str());
+        } else {
+            blog(LOG_WARNING, TAG "Target '%s': output stopped with code %d (last error: %s)", targetid_.c_str(),
+                 code, lastError.empty() ? "(none reported)" : lastError.c_str());
+        }
+
+        GetGlobalService().RunInUIThread([this, code, lastError]() {
             isStarting_ = false;
             isConnecting_ = false;
             isReconnecting_ = false;
             lastErrorCode_ = code;
+            reconnectAttempts_ = 0;
             ResetInfo();
             timer_->stop();
 
@@ -946,27 +1067,47 @@ public:
             btn_->setEnabled(true);
             SetMsg(u8"");
 
+            // Codes come from libobs's OBS_OUTPUT_* enum (obs-defs.h).
             switch(code)
             {
-                case 0:
-                    SetMsg(u8"");
+                case OBS_OUTPUT_SUCCESS:
                     break;
-                case -1:
+                case OBS_OUTPUT_BAD_PATH:
                     SetMsg(obs_module_text("Error.WrongRTMPUrl"));
                     break;
-                case -2:
+                case OBS_OUTPUT_CONNECT_FAILED:
                     SetMsg(obs_module_text("Error.ServerConnect"));
                     break;
-                case -3:
+                case OBS_OUTPUT_INVALID_STREAM:
                     SetMsg(obs_module_text("Error.ServerHandshake"));
                     break;
-                case -4:
+                case OBS_OUTPUT_ERROR:
                     SetMsg(obs_module_text("Error.ServerRefuse"));
+                    break;
+                case OBS_OUTPUT_DISCONNECTED:
+                    SetMsg(obs_module_text("Error.Disconnected"));
+                    break;
+                case OBS_OUTPUT_UNSUPPORTED:
+                    SetMsg(obs_module_text("Error.Unsupported"));
+                    break;
+                case OBS_OUTPUT_NO_SPACE:
+                    SetMsg(obs_module_text("Error.NoSpace"));
+                    break;
+                case OBS_OUTPUT_ENCODE_ERROR:
+                    SetMsg(obs_module_text("Error.EncodeError"));
+                    break;
+                case OBS_OUTPUT_HDR_DISABLED:
+                    SetMsg(obs_module_text("Error.HDRDisabled"));
                     break;
                 default:
                     SetMsg(obs_module_text("Error.Unknown"));
                     break;
             }
+
+            // The raw libobs message (copied on the emitting thread) is shown
+            // as a tooltip; it is English-only and meant for diagnosis.
+            if (code != OBS_OUTPUT_SUCCESS && !lastError.empty())
+                msg_->setToolTip(msg_->text() + "\n" + QString::fromUtf8(lastError.c_str()));
 
             UpdateStatusDot();
         });
